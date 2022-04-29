@@ -1,0 +1,8 @@
+git+https://github.com/nandantumu/f1tenth_gym.git#egg=f110_gym
+numpy
+matplotlib
+seaborn
+scipy
+torch
+ray
+joblib
