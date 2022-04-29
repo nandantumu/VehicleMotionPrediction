@@ -6,3 +6,4 @@ scipy
 torch
 ray
 joblib
+sklearn
