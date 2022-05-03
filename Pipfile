@@ -15,6 +15,7 @@ ray = "*"
 jupyter = "*"
 joblib = "*"
 sklearn = "*"
+tqdm = "*"
 
 [dev-packages]
 
