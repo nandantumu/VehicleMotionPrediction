@@ -16,6 +16,8 @@ jupyter = "*"
 joblib = "*"
 sklearn = "*"
 tqdm = "*"
+jupyterlab = "*"
+graphviz = "*"
 
 [dev-packages]
 
