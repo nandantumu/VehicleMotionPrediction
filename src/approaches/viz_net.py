@@ -2,6 +2,10 @@ from graphviz import Digraph
 from torch.autograd import Variable
 import torch
 
+"""
+From https://gist.github.com/wangg12/f11258583ffcc4728eb71adc0f38e832
+"""
+
 
 def make_dot(var, params=None):
     if params is not None:
