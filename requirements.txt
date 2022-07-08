@@ -4,6 +4,11 @@ matplotlib
 seaborn
 scipy
 torch
-ray
 joblib
+tqdm
+tensorboardX
+pandas
+joblib
+pillow
 sklearn
+pyyaml
