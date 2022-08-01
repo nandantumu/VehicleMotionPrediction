@@ -12,3 +12,5 @@ joblib
 pillow
 sklearn
 pyyaml
+av2
+ipywidgets
