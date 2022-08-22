@@ -31,7 +31,7 @@ class Method(Enum):
     LSTM = 1
 
 
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
 def _get_map_points(map_path, map_ext):
@@ -126,8 +126,8 @@ class TraceRelativeDataset(Dataset):
         return inputs, last_pose, target
 
 
-train_dataset = TraceRelativeDataset(no_race_train_frame, curve=False)
-test_dataset = TraceRelativeDataset(no_race_test_frame, curve=False)
+train_dataset = TraceRelativeDataset(train_frame, curve=False)
+test_dataset = TraceRelativeDataset(test_frame, curve=False)
 train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8)
 test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=True, num_workers=8)
 
@@ -251,13 +251,13 @@ class LSTMPredictorBicycle(nn.Module):
         self.hidden2output = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ELU(),
-            # nn.Linear(hidden_dim//2, hidden_dim//2),
-            # nn.ELU(),
+            nn.Linear(hidden_dim//2, hidden_dim//2),
+            nn.ELU(),
             nn.Linear(hidden_dim // 2, hidden_dim // 2),
             nn.BatchNorm1d(10),
             nn.Linear(hidden_dim // 2, control_outputs * 2 + 1),
         )
-        print("WARNING: 2 layer LSTM + 2 layer decoder")
+        print("WARNING: 2 layer LSTM + 4 layer decoder")
 
     def forward(self, inputs):
         lstm_out, _ = self.lstm(inputs)
@@ -416,7 +416,7 @@ def train_PIMP(
     aux_test_dataloader: DataLoader = None,
     aux_selection: List = RACE_SELECTION,
     horizon: int = 60,
-    lr=2e-3
+    lr=1e-3
 ):
     torch.autograd.set_detect_anomaly(True)
     net = LSTMPredictorBicycle(
@@ -427,10 +427,10 @@ def train_PIMP(
     )
     net.to(DEVICE)
     pytorch_total_params = sum(p.numel() for p in net.parameters())
-    directory = f"{prefix}/PIMP-{control_outputs}-{curvature.name}-{hidden_dim}-P{pytorch_total_params}-{lr}/"
+    directory = f"{prefix}/PIMP-{control_outputs}-{curvature.name}-{hidden_dim}-P{pytorch_total_params}-{lr}-{'CURR' if curriculum else 'NOCURR'}/"
     writer = SummaryWriter(directory)
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=2e-3)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     train_losses = list()
     test_losses = list()
     train_ades, test_ades, race_ades = list(), list(), list()
@@ -715,20 +715,17 @@ def train(
     hidden_dim: int = 32,
     epochs=100,
     control_outputs=10,
-    prefix="runs/toy/robustness-curr/fast/",
+    curriculum=True,
+    prefix="runs/toy/hyp-search-curr/",
 ):
     train_dataset = TraceRelativeDataset(
-        no_race_train_frame, curve=True if curvature is Curvature.CURVATURE else False
+        train_frame, curve=True if curvature is Curvature.CURVATURE else False
     )
     test_dataset = TraceRelativeDataset(
-        no_race_test_frame, curve=True if curvature is Curvature.CURVATURE else False
-    )
-    race_dataset = TraceRelativeDataset(
-        race_test_frame, curve=True if curvature is Curvature.CURVATURE else False
+        test_frame, curve=True if curvature is Curvature.CURVATURE else False
     )
     train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=True)
-    race_dataloader = DataLoader(race_dataset, batch_size=32, shuffle=True)
 
     if method is Method.PIMP:
         return train_PIMP(
@@ -739,9 +736,8 @@ def train(
             epochs=epochs,
             control_outputs=control_outputs,
             prefix=prefix,
-            curriculum=True,
+            curriculum=False,
             eps_per_input=4,
-            aux_test_dataloader=race_dataloader,
         )
     elif method is Method.LSTM:
         return train_LSTM(
@@ -751,7 +747,6 @@ def train(
             hidden_dim=hidden_dim,
             epochs=epochs,
             prefix=prefix,
-            aux_test_dataloader=race_dataloader,
         )
 
 
@@ -779,16 +774,28 @@ if __name__ == "__main__":
     
     
     jobs = [
-        (Method.PIMP, Curvature.CURVATURE, 8, 200, 2),
-        (Method.PIMP, Curvature.CURVATURE, 8, 200, 3),
-        (Method.PIMP, Curvature.CURVATURE, 8, 200, 4),
+        (Method.PIMP, Curvature.CURVATURE, 8, 200, 15),
+        (Method.PIMP, Curvature.CURVATURE, 16, 200, 15),
+        (Method.PIMP, Curvature.CURVATURE, 32, 200, 15),
+        (Method.PIMP, Curvature.CURVATURE, 64, 200, 15),
+        (Method.PIMP, Curvature.CURVATURE, 8, 200, 10),
+        (Method.PIMP, Curvature.CURVATURE, 16, 200, 10),
+        (Method.PIMP, Curvature.CURVATURE, 32, 200, 10),
+        (Method.PIMP, Curvature.CURVATURE, 64, 200, 10),
         (Method.PIMP, Curvature.CURVATURE, 8, 200, 5),
+        (Method.PIMP, Curvature.CURVATURE, 16, 200, 5),
+        (Method.PIMP, Curvature.CURVATURE, 32, 200, 5),
+        (Method.PIMP, Curvature.CURVATURE, 64, 200, 5),
+        (Method.PIMP, Curvature.CURVATURE, 8, 200, 2),
+        (Method.PIMP, Curvature.CURVATURE, 16, 200, 2),
+        (Method.PIMP, Curvature.CURVATURE, 32, 200, 2),
+        (Method.PIMP, Curvature.CURVATURE, 64, 200, 2),
     ]
 
     for j in jobs:
         print(j)
 
-    with multiprocessing.get_context("spawn").Pool(processes=3) as pool:
+    with multiprocessing.get_context("spawn").Pool(processes=4) as pool:
         res = pool.starmap(train, jobs)
 
     print(res)
