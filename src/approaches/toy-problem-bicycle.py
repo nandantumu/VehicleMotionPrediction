@@ -1,21 +1,22 @@
-from cgi import test
-from socketserver import ThreadingUDPServer
-from jinja2 import TemplateRuntimeError
-import torch
-import pandas as pd
+import random
+from enum import Enum, unique
+from typing import List
+
+import matplotlib.pylab as plt
 import numpy as np
+import pandas as pd
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pylab as plt
-from tqdm.autonotebook import tqdm
-from PIL import Image
-from typing import List
 import yaml
+from PIL import Image
 from tensorboardX import SummaryWriter
-from enum import Enum, unique
 from torch.multiprocessing import freeze_support
-import random
+from torch.utils.data import DataLoader, Dataset
+from tqdm.autonotebook import tqdm
+
+from pit.dynamics.kinematic_bicycle import Bicycle
+from pit.integration import Euler, RK4
 
 freeze_support()
 
@@ -30,9 +31,20 @@ class Method(Enum):
     PIMP = 0
     LSTM = 1
 
+class Model(nn.Module):
+    def __init__(self, *args, **kwargs):
+        """
+        Constructor for Neural Network.
+        """
+        super().__init__()
 
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
+torch.manual_seed(42)
+random.seed(42)
+np.random.seed(42)
 
 def _get_map_points(map_path, map_ext):
     with open(map_path + ".yaml", "r") as yaml_stream:
@@ -135,68 +147,26 @@ print(len(train_dataset), " in train")
 print(len(test_dataset), " in test")
 
 
-def bicycle_model_eval(inputs, last_poses):
-    # This version takes in an input of dim 5
-    BATCHES = inputs.shape[0]
-    states = []  # torch.zeros((81, 4))
-    L = 0.3302
-    TS = 0.1
-    X, Y, THETA, V = 0, 1, 2, 3
-    state = torch.zeros(
-        (
-            BATCHES,
-            4,
-        )
-    )
-    state[:, X] = last_poses[:, 0]
-    state[:, Y] = last_poses[:, 1]
-    state[:, THETA] = last_poses[:, 2]
-    state[:, V] = inputs[:, 0]
-    states.append(state)
-    for i in range(1, 81):
-        # Advance bicycle model
-        state = torch.zeros(
-            (
-                BATCHES,
-                4,
-            )
-        )
-        state[:, X] = states[i - 1][:, X] + (
-            TS * states[i - 1][:, V] * torch.cos(states[i - 1][:, THETA])
-        )
-        state[:, Y] = states[i - 1][:, Y] + (
-            TS * states[i - 1][:, V] * torch.sin(states[i - 1][:, THETA])
-        )
-        state[:, THETA] = states[i - 1][:, THETA] + (
-            TS * (states[i - 1][:, V] * torch.tan(inputs[:, 1])) / L
-        )
-        state[:, V] = states[i - 1][:, V] + TS * inputs[:, 2]
-        states.append(state)
-    trace = torch.dstack(states).movedim((0, 1, 2), (0, 2, 1))
-    trace = trace[:, 1:, :3]
-    return trace
-
-
 def custom_loss_func(prediction, target):
-    loss = F.smooth_l1_loss(prediction[:, :, :2], target[:, :, :2])
-    loss += 4 * F.smooth_l1_loss(prediction[:, :, 2], target[:, :, 2])
+    loss = F.smooth_l1_loss(prediction[..., :2], target[..., :2])
+    loss += 4 * F.smooth_l1_loss(prediction[..., 2], target[..., 2])
     # loss += 10*output[0]**2 if output[0]<0 else 0
     # loss += 2*torch.linalg.norm(output)**2
     return loss
 
 
 def average_displacement_error(prediction, target):
-    loss = torch.linalg.norm(prediction[:, :, :2] - target[:, :, :2], dim=2)
+    loss = torch.linalg.norm(prediction[..., :2] - target[..., :2], dim=1)
     ade = torch.mean(loss, dim=0)
     return torch.mean(ade)
 
 
 def final_displacement_error(prediction, target):
-    loss = torch.linalg.norm(prediction[:, -1, :2] - target[:, -1, :2], dim=1)
+    loss = torch.linalg.norm(prediction[..., :2] - target[..., :2], dim=1)
     return torch.mean(loss)
 
 
-class LSTMPredictor(nn.Module):
+class LSTMPredictor(Model):
     def __init__(self, input_dim=3, hidden_dim=32, horizon=60, num_layers=2):
         super(LSTMPredictor, self).__init__()
         self.hidden_dim = hidden_dim
@@ -224,7 +194,7 @@ class LSTMPredictor(nn.Module):
 
     def predict(self, inputs, last_poses, horizon=60):
         residuals = self.forward(inputs)
-        last_poses = last_poses.to(DEVICE)
+        #last_poses = last_poses.to(DEVICE)
         outputs = torch.tile(
             last_poses[:, :3].reshape(last_poses.shape[0], 1, 3), (1, 60, 1)
         )
@@ -232,9 +202,13 @@ class LSTMPredictor(nn.Module):
         return outputs
 
 
-class LSTMPredictorBicycle(nn.Module):
+class LSTMPredictorBicycle(Model):
     def __init__(
-        self, input_dim=3, hidden_dim=32, control_outputs=1, num_layers=2, horizon=60
+        self,
+        input_dim=3, 
+        hidden_dim=32, 
+        control_outputs=1, 
+        num_layers=2, horizon=60
     ):
         super(LSTMPredictorBicycle, self).__init__()
         self.hidden_dim = hidden_dim
@@ -251,14 +225,18 @@ class LSTMPredictorBicycle(nn.Module):
         self.hidden2output = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ELU(),
-            nn.Linear(hidden_dim//2, hidden_dim//2),
+            nn.Linear(hidden_dim // 2, hidden_dim // 2),
             nn.ELU(),
             nn.Linear(hidden_dim // 2, hidden_dim // 2),
             nn.BatchNorm1d(10),
             nn.Linear(hidden_dim // 2, control_outputs * 2 + 1),
         )
-        print("WARNING: 2 layer LSTM + 4 layer decoder")
 
+        self.dynamics = Bicycle(0.3302)
+        self.integrator = Euler(self.dynamics, timestep=0.1)
+
+
+        
     def forward(self, inputs):
         lstm_out, _ = self.lstm(inputs)
         output = self.hidden2output(lstm_out)
@@ -275,51 +253,33 @@ class LSTMPredictorBicycle(nn.Module):
     def predict(self, inputs, last_poses):
         # Compute LSTM output
         controls = self.forward(inputs)[:, -1]  # Take last prediction
-        last_poses = last_poses.to(DEVICE)
+        #last_poses = last_poses.to(DEVICE)
         BATCHES = controls.shape[0]
         states = []  # torch.zeros((81, 4))
         L = 0.3302
         TS = 0.1
         X, Y, THETA, V = 0, 1, 2, 3
         CDIMS = 2
+        HORIZON = 60
         state = torch.zeros(
             (
                 BATCHES,
                 4,
             ),
-            device=DEVICE,
+            device=self.device,
         )
         state[:, X] = last_poses[:, 0]
         state[:, Y] = last_poses[:, 1]
         state[:, THETA] = last_poses[:, 2]
         state[:, V] = controls[:, 0]
-        states.append(state)
+        
+        real_controls = torch.zeros((BATCHES, self.horizon, CDIMS), device=self.device)
         step_length = self.horizon // self.control_outputs
-        for i in range(1, self.horizon + 1):
-            # Advance bicycle model
-            step = min((i - 1) // step_length, self.control_outputs - 1)
-            state = torch.zeros(
-                (
-                    BATCHES,
-                    4,
-                ),
-                device=DEVICE,
-            )
-            state[:, X] = states[i - 1][:, X] + (
-                TS * states[i - 1][:, V] * torch.cos(states[i - 1][:, THETA])
-            )
-            state[:, Y] = states[i - 1][:, Y] + (
-                TS * states[i - 1][:, V] * torch.sin(states[i - 1][:, THETA])
-            )
-            state[:, THETA] = states[i - 1][:, THETA] + (
-                TS
-                * (states[i - 1][:, V] * torch.tan(controls[:, (step * CDIMS) + 1]))
-                / L
-            )
-            state[:, V] = states[i - 1][:, V] + TS * controls[:, (step * CDIMS) + 2]
-            states.append(state)
-        trace = torch.dstack(states).movedim((0, 1, 2), (0, 2, 1))
-        trace = trace[:, 1:, :3]
+        for i in range(1, self.horizon):
+            step = min((i) // step_length, self.control_outputs - 1)
+            real_controls[:,i] = controls[:, [(step * CDIMS) + 1,(step * CDIMS) + 2]]
+        
+        trace = self.integrator(state, real_controls)
         return trace
 
 
@@ -329,6 +289,7 @@ def create_debug_plot(
     test_dataset: TraceRelativeDataset = test_dataset,
     curvature: Curvature = Curvature.NO_CURVATURE,
     selection: list = [1912, 2465, 533, 905, 277, 1665, 2395, 61, 1054],
+    DEVICE="cpu"
 ):
     if selection is None:
         selection = np.random.choice(len(full_frame), 9)
@@ -412,13 +373,13 @@ def train_PIMP(
     control_outputs: int,
     prefix: str,
     curriculum: bool = True,
-    eps_per_input: int = 3,
+    eps_per_input: int = 2,
     aux_test_dataloader: DataLoader = None,
     aux_selection: List = RACE_SELECTION,
     horizon: int = 60,
-    lr=1e-3
+    lr=1e-3,
+    DEVICE="cpu",
 ):
-    torch.autograd.set_detect_anomaly(True)
     net = LSTMPredictorBicycle(
         input_dim=9 if curvature is Curvature.CURVATURE else 3,
         hidden_dim=hidden_dim,
@@ -475,7 +436,7 @@ def train_PIMP(
             writer.add_scalar("end_index", end_index, epoch)
 
             train_fig, train_ax = create_debug_plot(
-                net, train_dataloader.dataset, test_dataloader.dataset, curvature
+                net, train_dataloader.dataset, test_dataloader.dataset, curvature, DEVICE=DEVICE
             )
             cum_train_loss /= len(train_dataloader.dataset)
             cum_train_loss *= horizon / end_index
@@ -495,6 +456,7 @@ def train_PIMP(
             net.eval()
             progbar.set_description("TESTING")
             with torch.no_grad():
+                val_ade, val_fde, val_loss = list(), list(), list()
                 for input_data, last_pose, target_data in test_dataloader:
                     input_data = input_data.to(DEVICE)
                     last_pose = last_pose.to(DEVICE)
@@ -504,6 +466,10 @@ def train_PIMP(
                     cum_test_loss += loss.item()
                     fde += final_displacement_error(outp, target_data).cpu().numpy()
                     ade += average_displacement_error(outp, target_data).cpu().numpy()
+                    for trace in range(input_data.shape[0]):
+                        val_ade.append(average_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                        val_fde.append(final_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                        val_loss.append(custom_loss_func(outp[trace], target_data[trace]).item())
             cum_test_loss /= len(test_dataloader.dataset)
             test_losses.append(cum_test_loss)
             ade, fde = ade / len(test_dataloader.dataset), fde / len(
@@ -514,6 +480,9 @@ def train_PIMP(
             test_ades.append(ade)
             test_fdes.append(fde)
             writer.add_scalar("loss/test", cum_test_loss, epoch)
+            writer.add_histogram("distributions/ADE/test", np.array(val_ade), epoch)
+            writer.add_histogram("distributions/FDE/test", np.array(val_fde), epoch)
+            writer.add_histogram("distributions/loss/test", np.array(val_loss), epoch)
 
             if aux_test_dataloader is not None:
                 cum_race_test_loss = 0.0
@@ -521,6 +490,7 @@ def train_PIMP(
                 net.eval()
                 progbar.set_description("AUX TESTING")
                 with torch.no_grad():
+                    val_ade, val_fde, val_loss = list(), list(), list()
                     for input_data, last_pose, target_data in aux_test_dataloader:
                         input_data = input_data.to(DEVICE)
                         last_pose = last_pose.to(DEVICE)
@@ -532,12 +502,17 @@ def train_PIMP(
                         ade += (
                             average_displacement_error(outp, target_data).cpu().numpy()
                         )
+                        for trace in range(input_data.shape[0]):
+                            val_ade.append(average_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                            val_fde.append(final_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                            val_loss.append(custom_loss_func(outp[trace], target_data[trace]).item())
                     race_fig, race_ax = create_debug_plot(
                         net,
                         train_dataloader.dataset,
                         test_dataloader.dataset,
                         curvature,
                         selection=aux_selection,
+                        DEVICE=DEVICE
                     )
                 cum_race_test_loss /= len(aux_test_dataloader.dataset)
                 ade, fde = ade / len(aux_test_dataloader.dataset), fde / len(
@@ -549,6 +524,9 @@ def train_PIMP(
                 race_fdes.append(fde)
                 writer.add_figure("race_test/example_fig", race_fig, epoch)
                 writer.add_scalar("loss/race", cum_race_test_loss, epoch)
+                writer.add_histogram("distributions/ADE/race_test", np.array(val_ade), epoch)
+                writer.add_histogram("distributions/FDE/race_test", np.array(val_fde), epoch)
+                writer.add_histogram("distributions/loss/race_test", np.array(val_loss), epoch)
 
             if cum_test_loss <= min(test_losses):
                 torch.save(net.state_dict(), f"{directory}/best_model.pt")
@@ -577,8 +555,8 @@ def train_LSTM(
     prefix: str,
     aux_test_dataloader: DataLoader = None,
     aux_selection: List = RACE_SELECTION,
+    DEVICE="cpu"
 ):
-    torch.autograd.set_detect_anomaly(True)
     net = LSTMPredictor(
         input_dim=9 if curvature is Curvature.CURVATURE else 3,
         hidden_dim=hidden_dim,
@@ -617,7 +595,7 @@ def train_LSTM(
                 cum_train_loss += loss.item()
 
             train_fig, train_ax = create_debug_plot(
-                net, train_dataloader.dataset, test_dataloader.dataset, curvature
+                net, train_dataloader.dataset, test_dataloader.dataset, curvature, DEVICE=DEVICE
             )
             cum_train_loss /= len(train_dataloader.dataset)
             train_losses.append(cum_train_loss)
@@ -636,6 +614,7 @@ def train_LSTM(
             net.eval()
             progbar.set_description("TESTING")
             with torch.no_grad():
+                val_ade, val_fde, val_loss = list(), list(), list()
                 for input_data, last_pose, target_data in test_dataloader:
                     input_data = input_data.to(DEVICE)
                     last_pose = last_pose.to(DEVICE)
@@ -645,6 +624,10 @@ def train_LSTM(
                     cum_test_loss += loss.item()
                     fde += final_displacement_error(outp, target_data).cpu().numpy()
                     ade += average_displacement_error(outp, target_data).cpu().numpy()
+                    for trace in range(input_data.shape[0]):
+                        val_ade.append(average_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                        val_fde.append(final_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                        val_loss.append(custom_loss_func(outp[trace], target_data[trace]).item())
             cum_test_loss /= len(test_dataloader.dataset)
             test_losses.append(cum_test_loss)
             ade, fde = ade / len(test_dataloader.dataset), fde / len(
@@ -655,6 +638,9 @@ def train_LSTM(
             test_ades.append(ade)
             test_fdes.append(fde)
             writer.add_scalar("loss/test", cum_test_loss, epoch)
+            writer.add_histogram("distributions/ADE/test", np.array(val_ade), epoch)
+            writer.add_histogram("distributions/FDE/test", np.array(val_fde), epoch)
+            writer.add_histogram("distributions/loss/test", np.array(val_loss), epoch)
 
             if aux_test_dataloader is not None:
                 cum_race_test_loss = 0.0
@@ -662,6 +648,7 @@ def train_LSTM(
                 net.eval()
                 progbar.set_description("AUX TESTING")
                 with torch.no_grad():
+                    val_ade, val_fde, val_loss = list(), list(), list()
                     for input_data, last_pose, target_data in aux_test_dataloader:
                         input_data = input_data.to(DEVICE)
                         last_pose = last_pose.to(DEVICE)
@@ -673,12 +660,17 @@ def train_LSTM(
                         ade += (
                             average_displacement_error(outp, target_data).cpu().numpy()
                         )
+                        for trace in range(input_data.shape[0]):
+                            val_ade.append(average_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                            val_fde.append(final_displacement_error(outp[trace], target_data[trace]).cpu().numpy())
+                            val_loss.append(custom_loss_func(outp[trace], target_data[trace]).item())
                     race_fig, race_ax = create_debug_plot(
                         net,
                         train_dataloader.dataset,
                         test_dataloader.dataset,
                         curvature,
                         selection=aux_selection,
+                        DEVICE=DEVICE
                     )
                 cum_race_test_loss /= len(aux_test_dataloader.dataset)
                 ade, fde = ade / len(aux_test_dataloader.dataset), fde / len(
@@ -690,6 +682,9 @@ def train_LSTM(
                 race_fdes.append(fde)
                 writer.add_figure("race_test/example_fig", race_fig, epoch)
                 writer.add_scalar("loss/race", cum_race_test_loss, epoch)
+                writer.add_histogram("distributions/ADE/race_test", np.array(val_ade), epoch)
+                writer.add_histogram("distributions/FDE/race_test", np.array(val_fde), epoch)
+                writer.add_histogram("distributions/loss/race_test", np.array(val_loss), epoch)
 
             if cum_test_loss <= min(test_losses):
                 torch.save(net.state_dict(), f"{directory}/best_model.pt")
@@ -698,55 +693,72 @@ def train_LSTM(
             )
             progbar.update()
 
-    return {
-        "curvature": curvature,
-        "hidden_dims": hidden_dim,
-        "training_loss": cum_train_loss,
-        "test_loss": cum_test_loss,
-        "ade": ade,
-        "fde": fde,
-        "params": pytorch_total_params,
-    }
+    return (
+        {
+            "curvature": curvature,
+            "hidden_dims": hidden_dim,
+            "params": pytorch_total_params,
+        },{
+            "training_loss": cum_train_loss,
+            "test_loss": cum_test_loss,
+            "ade": ade,
+            "fde": fde,
+        }
+    )
 
 
-def train(
-    method: Method,
-    curvature: Curvature,
-    hidden_dim: int = 32,
-    epochs=100,
-    control_outputs=10,
-    curriculum=True,
-    prefix="runs/toy/hyp-search-curr/",
-):
+def train(params_def: dict):
+    print(params_def)
+    base_args = dict(hidden_dim = 32,
+                     epochs=100,
+                     control_outputs=10,
+                     curriculum=True,
+                     curriculum_epochs=2,
+                     prefix="runs/final-toy/performance-comparison/",
+                     batch_size=512,
+                     DEVICE="cpu"
+                    )
+    base_args.update(params_def)
+    assert("method" in base_args.keys())
+    assert("curvature" in base_args.keys())
+    from types import SimpleNamespace
+    v = SimpleNamespace(**base_args)
+    
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
+    
     train_dataset = TraceRelativeDataset(
-        train_frame, curve=True if curvature is Curvature.CURVATURE else False
+        train_frame, curve=True if v.curvature is Curvature.CURVATURE else False
     )
     test_dataset = TraceRelativeDataset(
-        test_frame, curve=True if curvature is Curvature.CURVATURE else False
+        test_frame, curve=True if v.curvature is Curvature.CURVATURE else False
     )
-    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=v.batch_size, shuffle=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=v.batch_size, shuffle=True)
 
-    if method is Method.PIMP:
+    if v.method is Method.PIMP:
         return train_PIMP(
             train_dataloader=train_dataloader,
             test_dataloader=test_dataloader,
-            curvature=curvature,
-            hidden_dim=hidden_dim,
-            epochs=epochs,
-            control_outputs=control_outputs,
-            prefix=prefix,
-            curriculum=False,
-            eps_per_input=4,
+            curvature=v.curvature,
+            hidden_dim=v.hidden_dim,
+            epochs=v.epochs,
+            control_outputs=v.control_outputs,
+            prefix=v.prefix,
+            curriculum=v.curriculum,
+            eps_per_input=v.curriculum_epochs,
+            DEVICE=v.DEVICE
         )
-    elif method is Method.LSTM:
+    elif v.method is Method.LSTM:
         return train_LSTM(
             train_dataloader=train_dataloader,
             test_dataloader=test_dataloader,
-            curvature=curvature,
-            hidden_dim=hidden_dim,
-            epochs=epochs,
-            prefix=prefix,
+            curvature=v.curvature,
+            hidden_dim=v.hidden_dim,
+            epochs=v.epochs,
+            prefix=v.prefix,
+            DEVICE=v.DEVICE
         )
 
 
@@ -763,39 +775,127 @@ def train_catch(*args, **kwargs):
 
 
 import threading
+
 import torch.multiprocessing as multiprocessing
-from torch.multiprocessing import Process, Pool
+from torch.multiprocessing import Pool, Process
+
+class GPURunner:
+    """Generates runners for jobs, which listen to a queue for jobs"""
+    def __init__(self, gpu_id: str):
+        self.gpu_id = gpu_id
+    
+    def model_training_process(self, input_queue: multiprocessing.Queue, output_queue: multiprocessing.Queue):
+        DEVICE = self.gpu_id
+        """
+        map_x, map_y = _get_map_points("../data_generation/track_config/Spielberg_map", ".png")
+
+        train_frame = pd.read_pickle("../../data/train_data.pkl")
+        test_frame = pd.read_pickle("../../data/test_data.pkl")
+        full_frame = pd.read_pickle("../../data/final_data.pkl")
+
+        no_race_train_frame = train_frame[
+            train_frame["selected_lane"].apply(
+                lambda x: True if x in ["left", "center", "right"] else False
+            )
+        ]
+        no_race_test_frame = test_frame[
+            test_frame["selected_lane"].apply(
+                lambda x: True if x in ["left", "center", "right"] else False
+            )
+            
+        ]
+        race_test_frame = full_frame[
+            full_frame["selected_lane"].apply(lambda x: True if x in ["race"] else False)
+        ]
+
+        RACE_SELECTION = [2246, 2329, 2711, 2596, 2465, 2365, 2805, 2554, 2266]
+        """
+        while not input_queue.empty():
+            job_definition = input_queue.get()
+            job_definition['DEVICE']=self.gpu_id
+            results = train(job_definition)
+            output_queue.put(results)
+            
+
 
 if __name__ == "__main__":
     freeze_support()
-    torch.manual_seed(42)
-    random.seed(42)
-    np.random.seed(42)
-    
+    multiprocessing.set_start_method('spawn')
+
+    prefix = "runs/final-toy/performance-comparison/"
     
     jobs = [
-        (Method.PIMP, Curvature.CURVATURE, 8, 200, 15),
-        (Method.PIMP, Curvature.CURVATURE, 16, 200, 15),
-        (Method.PIMP, Curvature.CURVATURE, 32, 200, 15),
-        (Method.PIMP, Curvature.CURVATURE, 64, 200, 15),
-        (Method.PIMP, Curvature.CURVATURE, 8, 200, 10),
-        (Method.PIMP, Curvature.CURVATURE, 16, 200, 10),
-        (Method.PIMP, Curvature.CURVATURE, 32, 200, 10),
-        (Method.PIMP, Curvature.CURVATURE, 64, 200, 10),
-        (Method.PIMP, Curvature.CURVATURE, 8, 200, 5),
-        (Method.PIMP, Curvature.CURVATURE, 16, 200, 5),
-        (Method.PIMP, Curvature.CURVATURE, 32, 200, 5),
-        (Method.PIMP, Curvature.CURVATURE, 64, 200, 5),
-        (Method.PIMP, Curvature.CURVATURE, 8, 200, 2),
-        (Method.PIMP, Curvature.CURVATURE, 16, 200, 2),
-        (Method.PIMP, Curvature.CURVATURE, 32, 200, 2),
-        (Method.PIMP, Curvature.CURVATURE, 64, 200, 2),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=10, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=20, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=40, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=60, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=10, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=20, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=40, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, control_outputs=60, curriculum=True, prefix=prefix),
+        dict(method=Method.LSTM, curvature=Curvature.CURVATURE, hidden_dim=16, epochs=200, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=10, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=20, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=40, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=60, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=10, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=20, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=40, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, control_outputs=60, curriculum=False, prefix=prefix),
+        dict(method=Method.LSTM, curvature=Curvature.CURVATURE, hidden_dim=8, epochs=200, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=10, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=20, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=40, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=60, curriculum=True, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=10, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=20, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=40, curriculum=False, prefix=prefix),
+        dict(method=Method.PIMP, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, control_outputs=60, curriculum=False, prefix=prefix),
+        dict(method=Method.LSTM, curvature=Curvature.CURVATURE, hidden_dim=4, epochs=200, prefix=prefix),
+  
     ]
 
+    jobs_queue = multiprocessing.Queue()
+    results_queue = multiprocessing.Queue()
+    
     for j in jobs:
-        print(j)
+        jobs_queue.put(j)
+       
+    gpus = [f'cuda:{i}' for i in range(3)]
+    procs_per_gpu = 4
+    gpus *= procs_per_gpu
+    
+    print(jobs_queue.qsize())
+    
+    objs_list = [GPURunner(gpu) for gpu in gpus]
+    
+    proclist = [multiprocessing.Process(target=runner.model_training_process,
+                                        args=(jobs_queue, results_queue)) for runner in objs_list]
+    
+    for proc in proclist:
+        proc.start()
+    
+    print(jobs_queue.qsize())
+    
+    procs_alive = True
+    hyp_params_writer = SummaryWriter(prefix)
+    
+    while procs_alive:
+        try:
+            params, results = results_queue.get(timeout=20)
+            hyp_params_writer.add_hparams(params, results)
+            print("Got a result: Params:{} \n Accuracy {}".format(params, results))
+        except:
+            pass
+        any_alive = False
+        for proc in proclist:
+            if proc.is_alive():
+                any_alive = True
+            else:
+                print(f"Proc {proc} is dead")
+                print(jobs_queue.qsize())
+        procs_alive = any_alive
 
-    with multiprocessing.get_context("spawn").Pool(processes=4) as pool:
-        res = pool.starmap(train, jobs)
+    for proc in proclist:
+        proc.join()
 
-    print(res)
