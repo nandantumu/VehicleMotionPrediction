@@ -1,10 +1,10 @@
-FROM nvidia/cuda:11.3.0-devel-ubuntu20.04
+FROM nvidia/cuda:11.6.0-devel-ubuntu20.04
 RUN apt-get update
 RUN apt update
 RUN apt install -y python3 python3-pip git
 RUN apt install -y libgl1-mesa-glx
 RUN DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata
-RUN pip3 install torch==1.10.0+cu113 torchvision==0.11.1+cu113 torchaudio==0.10.0+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html
+RUN pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
 
 COPY ./ /PIMP/VehicleMotionPrediction
 WORKDIR /PIMP/VehicleMotionPrediction

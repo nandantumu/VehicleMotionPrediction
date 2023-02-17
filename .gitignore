@@ -3,4 +3,8 @@ finals/
 **runs/
 **.egg-info/
 **.ipynb_checkpoints/
-**__pycache__/
+**/__pycache__/
+data/data_archive/
+.vscode/
+**trace.pkl
+**.DS_Store
