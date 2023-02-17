@@ -8,3 +8,4 @@ data/data_archive/
 .vscode/
 **trace.pkl
 **.DS_Store
+data/*.pkl
